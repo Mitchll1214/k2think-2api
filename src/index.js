@@ -1,7 +1,7 @@
 const http = require('http');
 const url = require('url');
 const querystring = require('querystring');
-const { createServer } = require('http');
+const { createServer: createHttpServer } = require('http');
 
 // K2Think API配置
 const K2THINK_API_URL = 'https://www.k2think.ai/api/guest/chat/completions';
@@ -247,10 +247,10 @@ async function parseRequestBody(req) {
 }
 
 // 创建服务器
-function createServer(env) {
+function createApiServer(env) {
   const requestHandler = createRequestHandler(env);
   
-  const server = http.createServer(async (req, res) => {
+  const server = createHttpServer(async (req, res) => {
     try {
       // 解析请求体
       if (req.method === 'POST') {
@@ -280,7 +280,7 @@ function startServer(port = 2004) {
     CLIENT_API_KEY: process.env.CLIENT_API_KEY || ''
   };
   
-  const server = createServer(env);
+  const server = createApiServer(env);
   server.listen(port, () => {
     console.log(`k2think-2api server running at http://localhost:${port}`);
   });
