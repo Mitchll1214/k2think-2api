@@ -2,6 +2,7 @@ const http = require('http');
 const url = require('url');
 const querystring = require('querystring');
 const { createServer: createHttpServer } = require('http');
+const fetch = require('node-fetch');
 
 // K2Think API配置
 const K2THINK_API_URL = 'https://www.k2think.ai/api/guest/chat/completions';
@@ -158,13 +159,15 @@ async function handleChatCompletion(req, res) {
     if (!response.ok) {
       const errorText = await response.text();
       console.error('K2Think API error:', response.status, errorText);
-      return res.status(response.status).json({
+      res.writeHead(response.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
         error: {
           message: `K2Think API error: ${response.status}`,
           type: 'api_error',
           code: response.status
         }
-      });
+      }));
+      return;
     }
     
     // 检查是否是流式响应
@@ -197,29 +200,32 @@ async function handleChatCompletion(req, res) {
           }
         } catch (error) {
           console.error('Error streaming response:', error);
-          res.status(500).json({
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
             error: {
               message: 'Error streaming response',
               type: 'streaming_error',
               code: 500
             }
-          });
+          }));
         }
       }
     } else {
       // 非流式响应
       const data = await response.json();
-      res.json(data);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(data));
     }
   } catch (error) {
     console.error('Error handling chat completion:', error);
-    res.status(500).json({
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
       error: {
         message: error.message,
         type: 'internal_server_error',
         code: 500
       }
-    });
+    }));
   }
 }
 
