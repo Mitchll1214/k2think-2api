@@ -14,7 +14,7 @@ RUN npm ci --only=production
 COPY src/ ./src/
 
 # 暴露端口
-EXPOSE 8080
+EXPOSE 2004
 
 # 设置环境变量（如果需要）
 ENV CLIENT_API_KEY=""
