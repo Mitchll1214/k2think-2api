@@ -1,7 +1,7 @@
 {
   "name": "k2think-2api",
   "version": "1.0.0",
-  "description": "Proxy for K2Think API",
+  "description": "OpenAI Reverse Proxy for MBZUAI-IFM/K2-Think",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
@@ -13,7 +13,12 @@
   "devDependencies": {
     "nodemon": "^2.0.15"
   },
-  "engines": {
-    "node": ">=14.0.0"
-  }
+  "keywords": [
+    "openai",
+    "proxy",
+    "k2think",
+    "mbzuai"
+  ],
+  "author": "",
+  "license": "MIT"
 }
