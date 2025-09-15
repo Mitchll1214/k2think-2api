@@ -1,30 +1,26 @@
 {
-  "name": "k2think-api-proxy",
+  "name": "k2think-2api",
   "version": "1.0.0",
-  "description": "K2Think API Proxy for OpenAI-compatible interface",
-  "main": "app.js",
+  "description": "K2Think API proxy service",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node app.js",
-    "dev": "nodemon app.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
   },
   "keywords": [
     "api",
     "proxy",
     "k2think",
-    "openai",
-    "chatgpt"
+    "chat",
+    "completion"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "uuid": "^9.0.1",
-    "node-fetch": "^2.7.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
+    "helmet": "^7.1.0",
+    "node-fetch": "^2.6.7"
   },
   "engines": {
     "node": ">=16.0.0"
