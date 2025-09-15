@@ -1,316 +1,447 @@
-const http = require('http');
-const url = require('url');
-const querystring = require('querystring');
-const { createServer: createHttpServer } = require('http');
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
 const fetch = require('node-fetch');
+const { Readable } = require('stream');
+const crypto = require('crypto');
 
-// K2Think API配置
-const K2THINK_API_URL = 'https://www.k2think.ai/api/guest/chat/completions';
+// Define interfaces (using JSDoc comments for better IDE support)
+/**
+ * @typedef {Object} ChatMessage
+ * @property {string} role
+ * @property {string} content
+ */
 
-// 请求头配置
+/**
+ * @typedef {Object} ChatCompletionRequest
+ * @property {string} model
+ * @property {ChatMessage[]} messages
+ * @property {boolean} [stream]
+ * @property {number} [temperature]
+ */
+
+// Constants
+const K2THINK_API_URL = "https://www.k2think.ai/api/guest/chat/completions";
 const DEFAULT_HEADERS = {
-  'Content-Type': 'application/json',
-  'User-Agent': 'k2think-2api/1.0.0'
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  "Content-Type": "application/json",
+  "Accept": "text/event-stream",
+  "Pragma": "no-cache",
+  "Origin": "https://www.k2think.ai",
+  "Sec-Fetch-Site": "same-origin",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Dest": "empty",
+  "Referer": "https://www.k2think.ai/guest",
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
 };
 
-// 解析SSE数据流
-async function aggregateStream(response) {
-  // 检查 response.body 是否存在
-  if (!response.body) {
-    throw new Error('Response body is missing');
-  }
+const PORT = process.env.PORT || 2001;
+const CLIENT_API_KEY = process.env.CLIENT_API_KEY || '';
 
-  // 在 Node.js 环境中，response.body 是一个 Readable 流
-  if (typeof response.body.on === 'function') {
-    // Node.js 环境
-    return new Promise((resolve, reject) => {
-      let data = '';
-      
-      response.body.on('data', (chunk) => {
-        data += chunk.toString();
-      });
-      
-      response.body.on('end', () => {
-        try {
-          // 移除 "data: " 前缀和最后的 "[DONE]"
-          const jsonStrings = data
-            .split('\n')
-            .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
-            .map(line => line.substring(6)); // 移除 "data: " 前缀
-          
-          const jsonObjects = jsonStrings.map(str => JSON.parse(str));
-          resolve(jsonObjects);
-        } catch (error) {
-          reject(error);
-        }
-      });
-      
-      response.body.on('error', (error) => {
-        reject(error);
-      });
-    });
-  } else {
-    // 浏览器环境或其他支持 ReadableStream 的环境
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let result = [];
+// Create Express app
+const app = express();
+
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Utility functions
+function parseApiKeys(keysString) {
+  if (!keysString) return [];
+  return keysString.split(',').map(key => key.trim()).filter(key => key.length > 0);
+}
+
+function createErrorResponse(res, message, status) {
+  return res.status(status).json({ error: message });
+}
+
+// Extract reasoning and answer content
+function extractReasoningAndAnswer(content) {
+  if (!content) return ["", ""];
+  try {
+    const reasoningPattern = /<details type="reasoning"[^>]*>.*?<summary>.*?<\/summary>(.*?)<\/details>/s;
+    const reasoningMatch = content.match(reasoningPattern);
+    const reasoning = reasoningMatch ? reasoningMatch[1].trim() : "";
     
-    while (true) {
-      const { done, value } = await reader.read();
-      
-      if (done) {
-        break;
+    const answerPattern = /<answer>(.*?)<\/answer>/s;
+    const answerMatch = content.match(answerPattern);
+    const answer = answerMatch ? answerMatch[1].trim() : "";
+    
+    return [reasoning, answer];
+  } catch (error) {
+    console.error("Error extracting reasoning and answer:", error);
+    return ["", ""];
+  }
+}
+
+// Calculate delta content
+function calculateDeltaContent(previous, current) {
+  if (!previous) return current;
+  if (!current) return "";
+  try {
+    return current.substring(previous.length);
+  } catch (error) {
+    console.error("Error calculating delta content:", error);
+    return current;
+  }
+}
+
+// Extract content from JSON
+function extractContentFromJson(obj) {
+  if (typeof obj !== "object" || obj === null) return ["", false, null, null];
+  
+  if (obj.usage) return ["", false, obj.usage, null];
+  if (obj.done === true) return ["", true, obj.usage, null];
+  
+  if (Array.isArray(obj.choices) && obj.choices.length > 0) {
+    const delta = obj.choices[0].delta || {};
+    const role = delta.role || null;
+    const contentPiece = delta.content || "";
+    return [contentPiece, false, null, role];
+  }
+  
+  if (typeof obj.content === "string") return [obj.content, false, null, null];
+  
+  return ["", false, null, null];
+}
+
+// Create stream response chunk
+function createStreamChunk(streamId, createdTime, model, delta, finishReason) {
+  const choices = [{
+    delta,
+    index: 0,
+    ...(finishReason && { finish_reason: finishReason })
+  }];
+  
+  const response = {
+    id: streamId,
+    object: "chat.completion.chunk",
+    created: createdTime,
+    model,
+    choices
+  };
+  
+  return `data: ${JSON.stringify(response)}\n\n`;
+}
+
+// Stream generator for Express
+function createK2Stream(payload, model) {
+  const streamId = `chatcmpl-${crypto.randomUUID()}`;
+  const createdTime = Math.floor(Date.now() / 1000);
+  let accumulatedContent = "";
+  let previousReasoning = "";
+  let previousAnswer = "";
+  let reasoningPhase = true;
+
+  const stream = new Readable({
+    read() {}
+  });
+
+  (async () => {
+    try {
+      // Send initial role
+      stream.push(createStreamChunk(streamId, createdTime, model, { role: "assistant" }));
+
+      const response = await fetch(K2THINK_API_URL, {
+        method: "POST",
+        headers: DEFAULT_HEADERS,
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        console.error(`K2Think API error: ${response.status} ${response.statusText}`, errorBody);
+        stream.destroy(new Error(`K2Think API error: ${response.status} ${response.statusText}`));
+        return;
       }
       
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n');
+      let buffer = "";
+      response.body.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          
+          const dataStr = line.substring(5).trim();
+          if (!dataStr || ["-1", "[DONE]", "DONE", "done"].includes(dataStr)) {
+            continue;
+          }
+          
+          let contentPiece = "";
+          try {
+            const obj = JSON.parse(dataStr);
+            const [piece, isDone] = extractContentFromJson(obj);
+            contentPiece = piece;
+            if (isDone) return;
+          } catch {
+            contentPiece = dataStr;
+          }
+          
+          if (contentPiece) {
+            accumulatedContent = contentPiece;
+            const [currentReasoning, currentAnswer] = extractReasoningAndAnswer(accumulatedContent);
+            
+            if (reasoningPhase && currentReasoning) {
+              const reasoningDelta = calculateDeltaContent(previousReasoning, currentReasoning);
+              if (reasoningDelta.trim()) {
+                stream.push(createStreamChunk(streamId, createdTime, model, { reasoning_content: reasoningDelta }));
+                previousReasoning = currentReasoning;
+              }
+            }
+            
+            if (currentAnswer && reasoningPhase) {
+              reasoningPhase = false;
+              if (currentReasoning && currentReasoning !== previousReasoning) {
+                const reasoningDelta = calculateDeltaContent(previousReasoning, currentReasoning);
+                if (reasoningDelta.trim()) {
+                  stream.push(createStreamChunk(streamId, createdTime, model, { reasoning_content: reasoningDelta }));
+                }
+              }
+            }
+            
+            if (!reasoningPhase && currentAnswer) {
+              const answerDelta = calculateDeltaContent(previousAnswer, currentAnswer);
+              if (answerDelta.trim()) {
+                stream.push(createStreamChunk(streamId, createdTime, model, { content: answerDelta }));
+                previousAnswer = currentAnswer;
+              }
+            }
+          }
+        }
+      });
+
+      response.body.on('end', () => {
+        // End stream
+        stream.push(createStreamChunk(streamId, createdTime, model, {}, "stop"));
+        stream.push("data: [DONE]\n\n");
+        stream.push(null);
+      });
+
+      response.body.on('error', (error) => {
+        console.error("Stream error:", error);
+        stream.destroy(error);
+      });
+      
+    } catch (error) {
+      console.error("Error creating K2 stream:", error);
+      stream.destroy(error);
+    }
+  })();
+
+  return stream;
+}
+
+// Aggregate stream response
+async function aggregateStream(response) {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    const pieces = [];
+    
+    response.body.on('data', (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
       
       for (const line of lines) {
-        if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-          try {
-            const jsonStr = line.substring(6); // 移除 "data: " 前缀
-            result.push(JSON.parse(jsonStr));
-          } catch (error) {
-            console.error('Error parsing JSON:', error);
-          }
+        if (!line.startsWith("data:")) continue;
+        
+        const dataStr = line.substring(5).trim();
+        if (!dataStr || ["-1", "[DONE]", "DONE", "done"].includes(dataStr)) {
+          continue;
         }
-      }
-    }
-    
-    return result;
-  }
-}
-
-// 创建请求处理函数
-function createRequestHandler(env) {
-  return async function (req, res) {
-    // 处理CORS
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    // 处理OPTIONS请求
-    if (req.method === 'OPTIONS') {
-      res.statusCode = 200;
-      res.end();
-      return;
-    }
-
-    const parsedUrl = url.parse(req.url);
-    const pathname = parsedUrl.pathname;
-    
-    try {
-      if (pathname === '/v1/models') {
-        handleModels(req, res);
-      } else if (pathname === '/v1/chat/completions') {
-        await handleChatCompletion(req, res);
-      } else {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          error: {
-            message: 'Not Found',
-            type: 'not_found_error',
-            code: 404
-          }
-        }));
-      }
-    } catch (error) {
-      console.error('Error handling request:', error);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: {
-          message: 'Internal Server Error',
-          type: 'internal_server_error',
-          code: 500
-        }
-      }));
-    }
-  };
-}
-
-// 处理模型列表
-function handleModels(req, res) {
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    object: 'list',
-    data: [
-      {
-        id: 'MBZUAI-IFM/K2-Think',
-        object: 'model',
-        created: 1677610602,
-        owned_by: 'MBZUAI-IFM'
-      }
-    ]
-  }));
-}
-
-// 处理聊天完成请求
-async function handleChatCompletion(req, res) {
-  try {
-    const payload = req.body;
-    
-    // 转发请求到 K2Think API
-    const response = await fetch(K2THINK_API_URL, {
-      method: 'POST',
-      headers: DEFAULT_HEADERS,
-      body: JSON.stringify(payload)
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('K2Think API error:', response.status, errorText);
-      res.writeHead(response.status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: {
-          message: `K2Think API error: ${response.status}`,
-          type: 'api_error',
-          code: response.status
-        }
-      }));
-      return;
-    }
-    
-    // 检查是否是流式响应
-    if (response.headers.get('content-type')?.includes('text/event-stream')) {
-      // 设置响应头
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      
-      // 在 Node.js 环境中，使用 pipe 方法直接转发流
-      if (typeof response.body.pipe === 'function') {
-        // Node.js 环境
-        response.body.pipe(res);
-      } else {
-        // 其他环境
-        const reader = response.body.getReader();
-        const encoder = new TextEncoder();
         
         try {
-          while (true) {
-            const { done, value } = await reader.read();
-            
-            if (done) {
-              res.write('data: [DONE]\n\n');
-              res.end();
-              break;
-            }
-            
-            res.write(value);
-          }
-        } catch (error) {
-          console.error('Error streaming response:', error);
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            error: {
-              message: 'Error streaming response',
-              type: 'streaming_error',
-              code: 500
-            }
-          }));
+          const obj = JSON.parse(dataStr);
+          const [piece, isDone] = extractContentFromJson(obj);
+          if (isDone) continue;
+          if (piece) pieces.push(piece);
+        } catch {
+          pieces.push(dataStr);
         }
       }
-    } else {
-      // 非流式响应
-      const data = await response.json();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(data));
-    }
-  } catch (error) {
-    console.error('Error handling chat completion:', error);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      error: {
-        message: error.message,
-        type: 'internal_server_error',
-        code: 500
-      }
-    }));
+    });
+    
+    response.body.on('end', () => {
+      const accumulatedContent = pieces.join("");
+      const [, answerContent] = extractReasoningAndAnswer(accumulatedContent);
+      resolve(answerContent.replace(/\\n/g, "\n"));
+    });
+    
+    response.body.on('error', reject);
+  });
+}
+
+// Get models list
+function getModelsList() {
+  return {
+    object: "list",
+    data: [{
+      id: "MBZUAI-IFM/K2-Think",
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: "talkai"
+    }]
+  };
+}
+
+// Authentication middleware
+function authenticateApiKey(req, res, next) {
+  if (!CLIENT_API_KEY) {
+    return next();
   }
-}
-
-// 解析请求体
-async function parseRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    
-    req.on('data', (chunk) => {
-      body += chunk.toString();
-    });
-    
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(body));
-      } catch (error) {
-        reject(error);
-      }
-    });
-    
-    req.on('error', (error) => {
-      reject(error);
-    });
-  });
-}
-
-// 创建服务器
-function createApiServer(env) {
-  const requestHandler = createRequestHandler(env);
   
-  const server = createHttpServer(async (req, res) => {
-    try {
-      // 解析请求体
-      if (req.method === 'POST') {
-        req.body = await parseRequestBody(req);
-      }
-      
-      requestHandler(req, res);
-    } catch (error) {
-      console.error('Error handling request:', error);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: {
-          message: 'Internal Server Error',
-          type: 'internal_server_error',
-          code: 500
-        }
-      }));
+  const validKeys = new Set(parseApiKeys(CLIENT_API_KEY));
+  const authHeader = req.headers.authorization;
+  let apiKey = authHeader;
+  
+  if (authHeader?.startsWith("Bearer ")) {
+    apiKey = authHeader.substring(7);
+  }
+  
+  if (!authHeader && validKeys.size > 0) {
+    return createErrorResponse(res, "API key required", 401);
+  }
+  
+  if (validKeys.size > 0 && (!apiKey || !validKeys.has(apiKey))) {
+    return createErrorResponse(res, "Invalid API key", 401);
+  }
+  
+  next();
+}
+
+// Routes
+app.get('/v1/models', authenticateApiKey, (req, res) => {
+  res.json(getModelsList());
+});
+
+app.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
+  const { body } = req;
+  
+  if (!body.messages || body.messages.length === 0) {
+    return createErrorResponse(res, "Messages required", 400);
+  }
+  
+  // Build K2Think compatible message list
+  const k2Messages = [];
+  let systemPrompt = "";
+  
+  for (const msg of body.messages) {
+    if (msg.role === "system") {
+      systemPrompt = msg.content;
+    } else if (msg.role === "user" || msg.role === "assistant") {
+      k2Messages.push({ role: msg.role, content: msg.content });
     }
-  });
+  }
   
-  return server;
-}
-
-// 启动服务器
-function startServer(port = 2004) {
-  const env = {
-    CLIENT_API_KEY: process.env.CLIENT_API_KEY || ''
+  if (systemPrompt) {
+    const userMsg = k2Messages.find(m => m.role === "user");
+    if (userMsg) {
+      userMsg.content = `${systemPrompt}\n\n${userMsg.content}`;
+    } else {
+      k2Messages.unshift({ role: "user", content: systemPrompt });
+    }
+  }
+  
+  const payload = {
+    stream: true, // Always request stream, aggregate if client asks non-stream
+    model: body.model,
+    messages: k2Messages,
+    params: {}
   };
   
-  const server = createApiServer(env);
-  server.listen(port, () => {
-    console.log(`k2think-2api server running at http://localhost:${port}`);
-  });
-  
-  // 添加错误处理
-  server.on('error', (err) => {
-    console.error('Server error:', err);
-  });
-  
-  // 添加未捕获的异常处理
-  process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err);
-  });
-  
-  // 添加未处理的 Promise 拒绝处理
-  process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  });
-}
+  try {
+    if (body.stream) {
+      // Streaming response
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      
+      const stream = createK2Stream(payload, body.model);
+      stream.pipe(res);
+      
+      req.on('close', () => {
+        stream.destroy();
+      });
+      
+    } else {
+      // Non-streaming response
+      const response = await fetch(K2THINK_API_URL, {
+        method: "POST",
+        headers: DEFAULT_HEADERS,
+        body: JSON.stringify(payload)
+      });
+      
+      if (!response.ok) {
+        throw new Error(`K2Think API error: ${response.status} ${response.statusText}`);
+      }
+      
+      const content = await aggregateStream(response);
+      const chatResponse = {
+        id: `chatcmpl-${crypto.randomUUID()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: body.model,
+        choices: [{
+          message: { role: "assistant", content },
+          index: 0,
+          finish_reason: "stop"
+        }],
+        usage: {
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0
+        }
+      };
+      
+      res.json(chatResponse);
+    }
+  } catch (error) {
+    console.error("Error handling chat completion:", error);
+    return createErrorResponse(res, "Internal server error", 500);
+  }
+});
 
-// 导出启动函数
-module.exports = { startServer };
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    service: 'k2think-2api',
+    port: PORT,
+    timestamp: new Date().toISOString()
+  });
+});
 
-// 如果直接运行此文件，则启动服务器
-if (require.main === module) {
-  startServer();
-}
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not Found' });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 K2Think-2API server is running on port ${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`🤖 Models endpoint: http://localhost:${PORT}/v1/models`);
+  console.log(`💬 Chat endpoint: http://localhost:${PORT}/v1/chat/completions`);
+  console.log(`🔑 API Key auth: ${CLIENT_API_KEY ? 'Enabled' : 'Disabled'}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 Received SIGTERM, shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('🛑 Received SIGINT, shutting down gracefully...');
+  process.exit(0);
+});
